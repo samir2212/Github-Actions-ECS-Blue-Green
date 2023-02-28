@@ -1,0 +1,87 @@
+name: Docker Image CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-central-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag, and push image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: waitly-app-prod
+          IMAGE_TAG: ${{ github.sha }}
+
+        run: |
+          docker build -f docker/Dockerfile -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+  Update-task-definition-and-upload-artifacts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-central-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Update Task Definition and Upload Artifacts and deploy
+        id: task-defination-update
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: waitly-app-prod
+          IMAGE_TAG: ${{ github.sha }}
+        shell: bash
+        run: |
+          export IMAGE_NAME="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          echo $IMAGE_NAME
+          sudo apt-get update && sudo apt-get install -y jq gettext-base
+          export TASK_FAMILY="PROD-Waitly"
+          echo $TASK_FAMILY
+          export CURRENT_TASK="$(aws ecs describe-task-definition --task-definition ${TASK_FAMILY})"
+          export NEW_TASK="$(echo $CURRENT_TASK | jq -rc --arg IMAGE ${IMAGE_NAME} '.taskDefinition | .containerDefinitions[0].image = $IMAGE | del(.taskDefinitionArn) | del(.revision) | del(.status) | del(.requiresAttributes)| del(.compatibilities) | del(.registeredAt) | del(.registeredBy)')"
+          echo $NEW_TASK > github-pipeline-artifacts/task-definition.json
+          aws ecs register-task-definition --cli-input-json "${NEW_TASK}"
+          export AWS_REGISTERED_DEFINATION=$(aws ecs describe-task-definition --task-definition $TASK_FAMILY)
+          export UPDATED_TASK_DEFINITION=$(echo $AWS_REGISTERED_DEFINATION |  jq '.taskDefinition.taskDefinitionArn' --raw-output)
+          envsubst < github-pipeline-artifacts/appspec-template.yaml >  github-pipeline-artifacts/appspec.yaml
+          cat github-pipeline-artifacts/appspec.yaml
+
+      - name: Deploy to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          #task-definition: ${{ steps.task-defination-update.outputs.newtaskdef }}
+          task-definition: github-pipeline-artifacts/task-definition.json
+          service: Waitly
+          cluster: PROD-Waitly
+          wait-for-service-stability: true
+          codedeploy-appspec: github-pipeline-artifacts/appspec.yaml
+          codedeploy-application: waitly-PROD-code-deploy
+          codedeploy-deployment-group: waitly-PROD-code-deploy
